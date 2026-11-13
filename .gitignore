@@ -15,3 +15,13 @@
 vendor/
 
 .idea/
+
+# Local builds and credentials
+/ecobee-exporter
+*.cache
+.env
+.env.*
+/db/
+/data/
+__pycache__/
+*.pyc

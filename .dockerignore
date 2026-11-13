@@ -1,0 +1,13 @@
+.git
+.github
+auth.cache
+*.cache
+*.test
+ecobee-exporter
+vendor
+.env
+.env.*
+db
+data
+*.pem
+__pycache__

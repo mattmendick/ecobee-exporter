@@ -1,82 +1,171 @@
-# ecobee_exporter
+# ecobee-exporter
 
-![Docker Pulls](https://img.shields.io/docker/pulls/billykwooten/ecobee-exporter.svg)
-![Docker Automated](https://img.shields.io/docker/cloud/automated/billykwooten/ecobee-exporter.svg)
-![Docker Build](https://img.shields.io/docker/cloud/build/billykwooten/ecobee-exporter.svg)
+A read-only Prometheus exporter for ecobee thermostats and room sensors.
 
-Lots of references from: [https://github.com/dichro/ecobee](https://github.com/dichro/ecobee)
+This fork incorporates [ejsuncy/ecobee-exporter at e5bf92252781](https://github.com/ejsuncy/ecobee-exporter/commit/e5bf922527813284d961dc47405c93588c5f692b),
+including its extended-runtime metrics, and builds on Billy Wooten's original
+exporter and [dichro/ecobee](https://github.com/dichro/ecobee).
 
-Check him out as well, initial idea from his repository.
+## Rebuild and test an existing deployment
 
-## Summary
+Requirements on the Docker host: Docker with the Compose plugin, Bash, and this
+checkout. Go is only needed inside the build container. Nothing is pushed to a registry.
 
-Ecobee exporter for metrics in Prometheus format
+Create a `.env` file alongside `compose.yaml`, containing your existing application
+key (this file is ignored by Git and excluded from Docker builds):
 
-Setting up an ecobee exporter is complicated due to the need to authenticate with the Ecobee API service via tokens.
-The first time you run this program it requires some manual steps, however the exporter will subsequently manage its
-own authentication afterwards if you give the program a volume somewhere to store passwords and manage it's authorization cache.
+```dotenv
+ECOBEE_APPKEY=your-existing-key
+```
 
-## First time running ecobee exporters, read this
+The Compose file reuses the existing external volume
+`ecobee-exporter_ecobee-exporter`. No reauthorization is needed. It runs as root
+for compatibility with the existing cache ownership; new standalone images otherwise
+default to UID/GID 65532. Token writes are atomic with permissions `0600`.
 
-1. Create a volume on your host so we can persist authentication cache
-2. Run `docker run -v <volume from step 1>:/db -p 9098:9098 -it billykwooten/ecobee-exporter --appkey p3NbLx6iSYTjXDFHIMtM77SWWPLRuEZ0`
-3. Open a browser and go to http://localhost:9098/metrics or `curl -X GET http://localhost:9098/metrics` from another terminal
-4. Docker will now print a pin like `Pin is "ig7j"`
-5. Go to [https://www.ecobee.com/consumerportal/index.html#/my-apps](https://www.ecobee.com/consumerportal/index.html#/my-apps)
-6. Register your app pin from step 4
-7. You can now run the container in any way you want, as long as you mount in the volume from step 1.
+### First migration from docker run
 
-   Example: [Binary/Docker Run Examples](https://github.com/billykwooten/ecobee_exporter/tree/development#usage)
+Take a secure backup of the token volume first. Find the old container's name
+(Docker may have assigned a random name), build before stopping it, then start Compose:
+
+```sh
+docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'
+docker compose build
+docker stop YOUR_OLD_CONTAINER_NAME
+docker compose up -d
+```
+
+Keep the old container stopped for rollback. Never run both exporters against the
+same authorization. Do not delete the external volume or revoke the app to upgrade.
+
+### Subsequent rebuilds
+
+```sh
+./rebuild.sh
+```
+
+This simply runs `docker compose build`, then `docker compose up -d --force-recreate`.
+Build failures leave the current exporter running. There is no automatic API
+readiness check or rollback; check the logs and `ecobee_up` after replacement:
+
+```sh
+docker compose logs --tail=50 ecobee-exporter
+curl -fsS http://localhost:9098/metrics | grep '^ecobee_up '
+```
+
+For rollback to the original standalone container, run `docker compose down`,
+then `docker start YOUR_OLD_CONTAINER_NAME`. The external token volume is retained,
+and its JSON format is compatible with the old exporter. Do not restore stale token
+backups over the live cache as part of an ordinary rollback.
+
+## API behavior
+
+The exporter uses the [documented ecobee v1 API](https://www.ecobee.com/home/developer/api/introduction/index.shtml)
+with `smartRead` authorization only. It never changes thermostat settings.
+
+- Background polling defaults to **three minutes**, the minimum allowed by
+  [ecobee's polling guidance](https://www.ecobee.com/home/developer/api/documentation/v1/operations/get-thermostat-summary.shtml).
+- Each cycle checks thermostat summary revisions. Full thermostat data is fetched
+  initially and when the revision map changes; unchanged summaries reuse cached data.
+  A changed map currently refreshes all registered thermostats in one request.
+- Prometheus scrapes only read memory; a 60-second scrape interval adds no API calls.
+- Requests are serialized and time-limited. Failed polls back off to as much as
+  30 minutes (or the configured interval if longer); HTTP 429 also honors `Retry-After`.
+- The last known good data is retained temporarily on failure, then omitted once
+  `max-cache-age` elapses without a successful poll.
+- Disconnected thermostats expose `ecobee_connected 0` without sensor/temperature
+  samples. Missing, unknown, calibrating, and non-finite readings are omitted.
+- Short/missing extended-runtime arrays are omitted rather than indexed unsafely.
+- Multiple thermostats in one response are supported; paginated responses currently
+  fail explicitly rather than silently expose only part of an account.
 
 ## Configuration
 
-Ecobee exporter can be controlled by both ENV or CLI flags as described below.
+| Environment | Flag | Default |
+| --- | --- | --- |
+| `ECOBEE_LISTEN_ADDRESS` | `--listen-address` | `:9098` |
+| `ECOBEE_APPKEY` | `--appkey` | Required; no shared default |
+| `ECOBEE_CACHEFILE` | `--cachefile` | `/db/auth.cache` |
+| `ECOBEE_POLL_INTERVAL` | `--poll-interval` | `3m` (minimum `3m`) |
+| `ECOBEE_MAX_CACHE_AGE` | `--max-cache-age` | `15m` (at least the polling interval) |
+| `ECOBEE_API_TIMEOUT` | `--api-timeout` | `30s` (per HTTP request) |
 
-| Environment        	       | CLI (`--flag`)              | Default                 	    | Description                                                                                                      |
-|----------------------------|-----------------------------|---------------------------- |------------------------------------------------------------------------------------------------------------------|
-| `ECOBEE_LISTEN_ADDRESS`           | `listen-address`            | `:9098`                     | The port for /metrics to listen on |
-| `ECOBEE_APPKEY`                   | `appkey`                    | `p3NbLx6iSYTjXDFHIMtM77SWWPLRuEZ0`                | Your Application API Key or you can use my app key seen here |
-| `ECOBEE_CACHEFILE`                     | `cachefile`                      | `/db/auth.cache`              | Cache file to store auth credentials |
+Flags override environment variables. `--version` prints build information.
+`/healthz` reports HTTP process liveness, not ecobee connectivity.
 
-## Usage
+There is no need to reauthorize when migrating a working cache. If authorization
+is actually missing/expired, run an explicit interactive command with your existing
+application key and a writable cache directory:
 
-Binary Usage
-```
-# Export ecobee metrics from thermostat
-./ecobee-exporter
-```
-
-Docker Usage (recommended method of running)
-```
-# Export ecobee metrics from thermostat using docker with volume for cache
-docker run -d --restart always --name=ecobee-exporter -v /example/persistancedirectory:/db -p 9098:9098 billykwooten/ecobee-exporter --appkey p3NbLx6iSYTjXDFHIMtM77SWWPLRuEZ0
-```
-
-Docker-compose Usage
-```
-  ecobee-exporter:
-    image: billykwooten/ecobee-exporter
-    container_name: ecobee-exporter
-    restart: always
-    ports:
-      - "9098:9098"
-    volumes:
-      - /volume1/docker/ecobee-exporter/data:/db
+```sh
+docker build -t ecobee-exporter:local .
+# Set ECOBEE_APPKEY securely in your shell first. Do not commit it.
+docker run --rm -it --user 0:0 \
+  -e ECOBEE_APPKEY \
+  -v ecobee-exporter_ecobee-exporter:/db \
+  ecobee-exporter:local --auth
 ```
 
-Prometheus Scrape Usage
-```
+Stop the regular exporter before authorizing. The command prints a PIN; authorize
+it in ecobee's My Apps portal, then press Enter. Normal server mode never prompts
+for input or silently replaces a corrupt cache. ecobee currently does not accept
+[new developer registrations](https://www.ecobee.com/en-us/developers/), so keep
+your existing application authorization safe.
+
+## Metrics and compatibility
+
+Existing names and labels, including sensor IDs and runtime stage labels, are
+preserved. Temperatures remain **Fahrenheit**, not Celsius. One intentional
+correction: `ecobee_currenthvacmode` and `ecobee_last_interval_energized_state`
+now use value **1**, rather than 0, for the mode named in their label. Review
+queries that depended on their former zero value.
+
+New exporter metrics:
+
+| Metric | Meaning |
+| --- | --- |
+| `ecobee_up` | Last polling cycle succeeded; initially 0 |
+| `ecobee_poll_errors_total` | Failed polling cycles since startup |
+| `ecobee_last_successful_poll_timestamp_seconds` | Last successful API check, even if revisions were unchanged |
+| `ecobee_last_data_fetch_timestamp_seconds` | Last full thermostat fetch, **not** the time the thermostat observed the data |
+| `ecobee_connected` | Connection state per thermostat |
+| `ecobee_exporter_build_info` | Build version and revision |
+
+`ecobee_fetch_time` now measures the latest background polling cycle.
+Health timestamps are absent until the first successful cycle. Cached values can
+remain visible while `ecobee_up` is 0; use the health metrics when alerting.
+A successful unchanged summary validates the cache but does not imply fresh
+device telemetry. ecobee cloud data is not an instantaneous local-device feed.
+
+`ecobee_last_interval_runtime` is a **gauge**, in seconds for the latest reported
+five-minute interval. Do not apply `rate()` or treat repeated scrapes as new
+runtime intervals. Occupancy means motion detected within the preceding 30 minutes,
+not instantaneous motion.
+
+Example Prometheus configuration:
+
+```yaml
 scrape_configs:
-  - job_name: 'ecobee-exporter'
+  - job_name: ecobee-exporter
     scrape_interval: 60s
     static_configs:
-      - targets: ['ecobee-exporter:9098']
+      - targets: ['YOUR_DOCKER_HOST:9098']
 ```
+
+Expose this endpoint only on a trusted network; metrics include thermostat and
+room names. Credentials remain secrets even though the rebuild script does not
+print them: Docker users can inspect container arguments/environment.
 
 ## Development
 
-If you'd like to build this yourself you can clone this repo and run:
+Requires Go 1.27.4+.
 
+```sh
+go test -race ./...
+go vet ./...
+bash -n rebuild.sh
+go build .
 ```
-./script/cibuild
-```
+
+Tests use synthetic data and local mock HTTP servers, never real credentials.
+`./script/cibuild` also builds a local native-architecture image; it does not push.

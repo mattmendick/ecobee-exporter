@@ -1,24 +1,16 @@
-########################
-# Build Container Creation
-########################
-
-FROM golang:1.16 as build
-
+FROM golang:1.27.4 AS build
 ARG LD_FLAGS
-
-WORKDIR /go/src/github.com/billykwooten/ecobee-exporter
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
+RUN go test ./...
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "$LD_FLAGS" -o /go/bin/app .
+RUN mkdir /db && chown 65532:65532 /db
 
-RUN go version
-RUN go mod vendor
-RUN GO111MODULE=on CGO_ENABLED=1 go test -race -mod vendor ./...
-RUN GO111MODULE=on CGO_ENABLED=0 go build -mod vendor -ldflags "$LD_FLAGS" -o /go/bin/app .
-
-########################
-# Build App Container
-########################
-
-FROM gcr.io/distroless/static
-
-COPY --from=build /go/bin/app /
-ENTRYPOINT [ "/app" ]
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /go/bin/app /app
+COPY --from=build --chown=65532:65532 /db /db
+EXPOSE 9098
+VOLUME ["/db"]
+ENTRYPOINT ["/app"]

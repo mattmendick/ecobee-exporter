@@ -31,14 +31,13 @@ fi
 
 taskStart "go mod"
 taskProgress "Downloading mod files"
-GO111MODULE=on go mod vendor
-GO111MODULE=on go mod tidy
-GO111MODULE=on go mod verify
+go mod download
+go mod verify
+go test -race ./...
+go vet ./...
 
 taskProgress "docker"
-docker buildx create --use
-docker buildx build --build-arg LD_FLAGS="$LD_FLAGS" -f Dockerfile --platform linux/arm64/v8 --load -t "${IMAGE_NAME}:${IMAGE_TAG}-arm64" .
-docker buildx build --build-arg LD_FLAGS="$LD_FLAGS" -f Dockerfile --platform linux/amd64 --load -t "${IMAGE_NAME}:${IMAGE_TAG}-amd64" .
+docker build --build-arg LD_FLAGS="$LD_FLAGS" -f Dockerfile -t "${IMAGE_NAME}:${IMAGE_TAG}" .
 
 echo "==> Finished building Docker image for ${IMAGE_NAME}:${IMAGE_TAG}"
 

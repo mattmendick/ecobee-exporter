@@ -46,9 +46,9 @@ fi
 taskStart "test"
 
 taskProgress "unit tests"
-go test -mod=vendor -race  "$RUN_TEST" ./... $VERBOSE $NO_CACHE
+go test -race ${RUN_TEST:+"$RUN_TEST"} ./... $VERBOSE $NO_CACHE
 
 if [ ! $SKIP_INTEGRATION ]; then
     taskProgress "integration tests"
-    go test -mod=vendor -p 1 -tags=integration "$RUN_TEST" ./... $VERBOSE $NO_CACHE
+    go test -p 1 -tags=integration ${RUN_TEST:+"$RUN_TEST"} ./... $VERBOSE $NO_CACHE
 fi

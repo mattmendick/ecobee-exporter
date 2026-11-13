@@ -1,243 +1,223 @@
-// Package prometheus provides Prometheus support for ecobee metrics.
+// Package collector exposes cached ecobee telemetry as Prometheus metrics.
 package collector
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
+	"math"
 	"strconv"
+	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
-
-	"github.com/billykwooten/go-ecobee/ecobee"
+	"github.com/mattmendick/ecobee-exporter/internal/ecobee"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-type descs string
-
-func (d descs) new(fqName, help string, variableLabels []string) *prometheus.Desc {
-	return prometheus.NewDesc(fmt.Sprintf("%s_%s", d, fqName), help, variableLabels, nil)
+type API interface {
+	Summary(context.Context) (map[string]string, error)
+	Thermostats(context.Context) ([]ecobee.Thermostat, error)
 }
 
-// eCollector implements prometheus.eCollector to gather ecobee metrics on-demand.
-type eCollector struct {
-	client *ecobee.Client
-
-	// per-query descriptors
-	fetchTime *prometheus.Desc
-
-	// runtime descriptors
-	actualTemperature, targetTemperatureMin, targetTemperatureMax, lastIntervalRuntime, lastIntervalEnergizedStage *prometheus.Desc
-
-	// sensor descriptors
-	temperature, humidity, occupancy, inUse, currentHvacMode *prometheus.Desc
+type Collector struct {
+	client                 API
+	interval, maxAge       time.Duration
+	mu                     sync.RWMutex
+	revisions              map[string]string
+	thermostats            []ecobee.Thermostat
+	lastSuccess, lastFetch time.Time
+	duration               float64
+	success                bool
+	errors                 uint64
+	desc                   map[string]*prometheus.Desc
 }
 
-// NewEcobeeCollector returns a new eCollector with the given prefix assigned to all
-// metrics. Note that Prometheus metrics must be unique! Don't try to create
-// two Collectors with the same metric prefix.
-func NewEcobeeCollector(c *ecobee.Client, metricPrefix string) *eCollector {
-	d := descs(metricPrefix)
+func New(client API, interval, maxAge time.Duration) *Collector {
+	c := &Collector{client: client, interval: interval, maxAge: maxAge, desc: make(map[string]*prometheus.Desc)}
+	t := []string{"thermostat_id", "thermostat_name"}
+	s := []string{"thermostat_id", "thermostat_name", "sensor_id", "sensor_name", "sensor_type"}
+	add := func(name, help string, labels []string) {
+		c.desc[name] = prometheus.NewDesc("ecobee_"+name, help, labels, nil)
+	}
+	add("fetch_time", "Duration of the last API polling cycle in seconds.", nil)
+	add("up", "Whether the last API polling cycle succeeded (not Prometheus scrape health).", nil)
+	add("poll_errors_total", "Number of failed API polling cycles.", nil)
+	add("last_successful_poll_timestamp_seconds", "Unix time of the last successful API check, including unchanged summaries.", nil)
+	add("last_data_fetch_timestamp_seconds", "Unix time of the last successful full thermostat fetch; not the device observation time.", nil)
+	add("connected", "Whether the thermostat is connected to ecobee.", t)
+	add("actual_temperature", "Thermostat-averaged current temperature in degrees Fahrenheit.", t)
+	add("target_temperature_min", "Heating target in degrees Fahrenheit.", t)
+	add("target_temperature_max", "Cooling target in degrees Fahrenheit.", t)
+	add("temperature", "Sensor temperature in degrees Fahrenheit.", s)
+	add("humidity", "Sensor relative humidity in percent.", s)
+	add("occupancy", "Computed occupancy: motion detected within the past 30 minutes (0 or 1).", s)
+	add("in_use", "Whether a sensor participates in thermostat calculations (0 or 1).", s)
+	add("currenthvacmode", "Configured HVAC mode; the selected mode has value 1.", append(append([]string{}, t...), "current_hvac_mode"))
+	add("last_interval_runtime", "Runtime in the latest reported five-minute interval in seconds (0-300); not a counter.", append(append([]string{}, t...), "stage_name", "stage_mechanism"))
+	add("last_interval_energized_state", "HVAC state in the latest reported interval; the selected state has value 1.", append(append([]string{}, t...), "stage"))
+	return c
+}
 
-	// fields common across multiple metrics
-	runtime := []string{"thermostat_id", "thermostat_name"}
-	sensor := append(runtime, "sensor_id", "sensor_name", "sensor_type")
-
-	return &eCollector{
-		client: c,
-
-		// collector metrics
-		fetchTime: d.new(
-			"fetch_time",
-			"elapsed time fetching data via Ecobee API",
-			nil,
-		),
-
-		// thermostat (aka runtime) metrics
-		actualTemperature: d.new(
-			"actual_temperature",
-			"thermostat-averaged current temperature",
-			runtime,
-		),
-		targetTemperatureMax: d.new(
-			"target_temperature_max",
-			"maximum temperature for thermostat to maintain",
-			runtime,
-		),
-		targetTemperatureMin: d.new(
-			"target_temperature_min",
-			"minimum temperature for thermostat to maintain",
-			runtime,
-		),
-		lastIntervalRuntime: d.new(
-			"last_interval_runtime",
-			"last (latest reported) interval runtime of given stage mechanism (seconds, 0-300)",
-			[]string{"thermostat_id", "thermostat_name", "stage_name", "stage_mechanism"},
-		),
-		lastIntervalEnergizedStage: d.new(
-			"last_interval_energized_state",
-			"last (latest reported) interval energized stage (one of: heatStage10n, heatStage20n, heatStage30n, heatOff, compressorCoolStage10n, compressorCoolStage20n, compressorCoolOff, compressorHeatStage10n, compressorHeatStage20n, compressorHeatOff, economyCycle",
-			[]string{"thermostat_id", "thermostat_name", "stage"},
-		),
-
-		// sensor metrics
-		temperature: d.new(
-			"temperature",
-			"temperature reported by a sensor in degrees",
-			sensor,
-		),
-		humidity: d.new(
-			"humidity",
-			"humidity reported by a sensor in percent",
-			sensor,
-		),
-		occupancy: d.new(
-			"occupancy",
-			"occupancy reported by a sensor (0 or 1)",
-			sensor,
-		),
-		inUse: d.new(
-			"in_use",
-			"is sensor being used in thermostat calculations (0 or 1)",
-			sensor,
-		),
-		currentHvacMode: d.new(
-			"currenthvacmode",
-			"current hvac mode of thermostat",
-			[]string{"thermostat_id", "thermostat_name", "current_hvac_mode"},
-		),
+// Run is the sole API caller. Scrapes never initiate network or authentication work.
+func (c *Collector) Run(ctx context.Context) {
+	delay := time.Duration(0)
+	backoff := c.interval
+	for {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		err := c.poll(ctx)
+		delay = c.interval
+		if err != nil {
+			slog.Error("ecobee poll failed", "error", err)
+			delay = backoff
+			backoff = min(backoff*2, max(30*time.Minute, c.interval))
+			var rateLimit *ecobee.RateLimitError
+			if errors.As(err, &rateLimit) {
+				delay = max(delay, rateLimit.After)
+			}
+		} else {
+			backoff = c.interval
+		}
 	}
 }
 
-// Describe dumps all metric descriptors into ch.
-func (c *eCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.fetchTime
-	ch <- c.actualTemperature
-	ch <- c.targetTemperatureMax
-	ch <- c.targetTemperatureMin
-	ch <- c.temperature
-	ch <- c.humidity
-	ch <- c.occupancy
-	ch <- c.inUse
-	ch <- c.currentHvacMode
-	ch <- c.lastIntervalRuntime
+func (c *Collector) poll(ctx context.Context) (err error) {
+	start := time.Now()
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.duration = time.Since(start).Seconds()
+		c.success = err == nil
+		if err != nil {
+			c.errors++
+		} else {
+			c.lastSuccess = time.Now()
+		}
+	}()
+	revisions, err := c.client.Summary(ctx)
+	if err != nil {
+		return err
+	}
+	if c.revisions != nil && maps.Equal(revisions, c.revisions) {
+		return nil
+	}
+	thermostats, err := c.client.Thermostats(ctx)
+	if err != nil {
+		return err
+	}
+	if len(thermostats) != len(revisions) {
+		return fmt.Errorf("thermostat list does not match summary; retry next cycle")
+	}
+	seen := make(map[string]bool, len(thermostats))
+	for _, thermostat := range thermostats {
+		if _, ok := revisions[thermostat.Identifier]; !ok || seen[thermostat.Identifier] {
+			return fmt.Errorf("unexpected or duplicate thermostat identifier")
+		}
+		seen[thermostat.Identifier] = true
+	}
+	// Only commit revisions after details succeed, so a failed fetch is retried.
+	c.mu.Lock()
+	c.thermostats = thermostats
+	c.lastFetch = time.Now()
+	c.revisions = revisions
+	c.mu.Unlock()
+	return nil
 }
 
-// Collect retrieves thermostat data via the ecobee API.
-func (c *eCollector) Collect(ch chan<- prometheus.Metric) {
-	start := time.Now()
-	tt, err := c.client.GetThermostats(ecobee.Selection{
-		SelectionType:          "registered",
-		IncludeSensors:         true,
-		IncludeRuntime:         true,
-		IncludeSettings:        true,
-		IncludeExtendedRuntime: true,
-	})
-	elapsed := time.Now().Sub(start)
-	ch <- prometheus.MustNewConstMetric(c.fetchTime, prometheus.GaugeValue, elapsed.Seconds())
-	if err != nil {
-		log.Error(err)
+func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
+	for _, desc := range c.desc {
+		ch <- desc
+	}
+}
+
+func boolValue(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
+}
+func validNumber(v float64) bool {
+	return v != -5002 && v != -5003 && !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	emit := func(name string, value float64, labels ...string) {
+		ch <- prometheus.MustNewConstMetric(c.desc[name], prometheus.GaugeValue, value, labels...)
+	}
+	emit("fetch_time", c.duration)
+	emit("up", boolValue(c.success))
+	ch <- prometheus.MustNewConstMetric(c.desc["poll_errors_total"], prometheus.CounterValue, float64(c.errors))
+	if c.lastSuccess.IsZero() {
 		return
 	}
-	for _, t := range tt {
-		tFields := []string{t.Identifier, t.Name}
-		if t.Runtime.Connected {
-			ch <- prometheus.MustNewConstMetric(
-				c.actualTemperature, prometheus.GaugeValue, float64(t.Runtime.ActualTemperature)/10, tFields...,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.targetTemperatureMax, prometheus.GaugeValue, float64(t.Runtime.DesiredCool)/10, tFields...,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.targetTemperatureMin, prometheus.GaugeValue, float64(t.Runtime.DesiredHeat)/10, tFields...,
-			)
-
-			// API returns last 3 intervals; we're only interested in the last (latest) one
-			lastIndex := 2
-
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.HeatPump1[lastIndex]), t.Identifier, t.Name, "heatStage1On", "heatPump1",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.HeatPump2[lastIndex]), t.Identifier, t.Name, "heatStage2On", "heatPump2",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.AuxHeat1[lastIndex]), t.Identifier, t.Name, "heatStage1On", "auxHeat1",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.AuxHeat2[lastIndex]), t.Identifier, t.Name, "heatStage2On", "auxHeat2",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Cool1[lastIndex]), t.Identifier, t.Name, "compressorCoolStage1On", "cool1",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Cool2[lastIndex]), t.Identifier, t.Name, "compressorCoolStage2On", "cool2",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Fan[lastIndex]), t.Identifier, t.Name, "fan", "fan",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Humidifier[lastIndex]), t.Identifier, t.Name, "humidifier", "humidifier",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Dehumidifier[lastIndex]), t.Identifier, t.Name, "dehumidifier", "dehumidifier",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Economizer[lastIndex]), t.Identifier, t.Name, "economizer", "economizer",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalRuntime, prometheus.GaugeValue, float64(t.ExtendedRuntime.Ventilator[lastIndex]), t.Identifier, t.Name, "ventilator", "ventilator",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.lastIntervalEnergizedStage, prometheus.GaugeValue, 0, t.Identifier, t.Name, t.ExtendedRuntime.HvacMode[lastIndex],
-			)
-
-			ch <- prometheus.MustNewConstMetric(
-				c.currentHvacMode, prometheus.GaugeValue, 0, t.Identifier, t.Name, t.Settings.HvacMode,
-			)
-
+	emit("last_successful_poll_timestamp_seconds", float64(c.lastSuccess.Unix()))
+	emit("last_data_fetch_timestamp_seconds", float64(c.lastFetch.Unix()))
+	// Retain last-known-good samples briefly, then omit them rather than report stale data forever.
+	if time.Since(c.lastSuccess) > c.maxAge {
+		return
+	}
+	for _, t := range c.thermostats {
+		labels := []string{t.Identifier, t.Name}
+		emit("connected", boolValue(t.Runtime.Connected), labels...)
+		if !t.Runtime.Connected {
+			continue
 		}
-		for _, s := range t.RemoteSensors {
-			sFields := append(tFields, s.ID, s.Name, s.Type)
-			inUse := float64(0)
-			if s.InUse {
-				inUse = 1
+		for name, value := range map[string]*int{"actual_temperature": t.Runtime.ActualTemperature, "target_temperature_min": t.Runtime.DesiredHeat, "target_temperature_max": t.Runtime.DesiredCool} {
+			if value != nil && validNumber(float64(*value)) {
+				emit(name, float64(*value)/10, labels...)
 			}
-			ch <- prometheus.MustNewConstMetric(
-				c.inUse, prometheus.GaugeValue, inUse, sFields...,
-			)
-			for _, sc := range s.Capability {
-				switch sc.Type {
-				case "temperature":
-					if v, err := strconv.ParseFloat(sc.Value, 64); err == nil {
-						ch <- prometheus.MustNewConstMetric(
-							c.temperature, prometheus.GaugeValue, v/10, sFields...,
-						)
-					} else {
-						log.Error(err)
+		}
+		if t.Settings.HvacMode != "" {
+			emit("currenthvacmode", 1, t.Identifier, t.Name, t.Settings.HvacMode)
+		}
+		r := t.ExtendedRuntime
+		for _, stage := range []struct {
+			name, mechanism string
+			values          []int
+		}{
+			{"heatStage1On", "heatPump1", r.HeatPump1}, {"heatStage2On", "heatPump2", r.HeatPump2},
+			{"heatStage1On", "auxHeat1", r.AuxHeat1}, {"heatStage2On", "auxHeat2", r.AuxHeat2},
+			{"compressorCoolStage1On", "cool1", r.Cool1}, {"compressorCoolStage2On", "cool2", r.Cool2},
+			{"fan", "fan", r.Fan}, {"humidifier", "humidifier", r.Humidifier}, {"dehumidifier", "dehumidifier", r.Dehumidifier},
+			{"economizer", "economizer", r.Economizer}, {"ventilator", "ventilator", r.Ventilator},
+		} {
+			// Only the third entry represents the expected latest interval. Never substitute an older entry.
+			if len(stage.values) >= 3 && stage.values[2] >= 0 && stage.values[2] <= 300 {
+				emit("last_interval_runtime", float64(stage.values[2]), t.Identifier, t.Name, stage.name, stage.mechanism)
+			}
+		}
+		if len(r.HvacMode) >= 3 && r.HvacMode[2] != "" {
+			emit("last_interval_energized_state", 1, t.Identifier, t.Name, r.HvacMode[2])
+		}
+		for _, sensor := range t.RemoteSensors {
+			labels := []string{t.Identifier, t.Name, sensor.ID, sensor.Name, sensor.Type}
+			emit("in_use", boolValue(sensor.InUse), labels...)
+			for _, capability := range sensor.Capability {
+				switch capability.Type {
+				case "temperature", "humidity":
+					v, err := strconv.ParseFloat(capability.Value, 64)
+					if err != nil || !validNumber(v) {
+						continue
 					}
-				case "humidity":
-					if v, err := strconv.ParseFloat(sc.Value, 64); err == nil {
-						ch <- prometheus.MustNewConstMetric(
-							c.humidity, prometheus.GaugeValue, v, sFields...,
-						)
-					} else {
-						log.Error(err)
+					if capability.Type == "temperature" {
+						v /= 10
+					} else if v < 0 || v > 100 {
+						continue
 					}
+					emit(capability.Type, v, labels...)
 				case "occupancy":
-					switch sc.Value {
-					case "true":
-						ch <- prometheus.MustNewConstMetric(
-							c.occupancy, prometheus.GaugeValue, 1, sFields...,
-						)
-					case "false":
-						ch <- prometheus.MustNewConstMetric(
-							c.occupancy, prometheus.GaugeValue, 0, sFields...,
-						)
-					default:
-						log.Errorf("unknown sensor occupancy value %q", sc.Value)
+					if capability.Value == "true" || capability.Value == "false" {
+						emit("occupancy", boolValue(capability.Value == "true"), labels...)
 					}
-				default:
-					log.Infof("ignoring sensor capability %q", sc.Type)
 				}
 			}
 		}
